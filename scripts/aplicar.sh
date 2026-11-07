@@ -18,8 +18,12 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TPL="$DIR/$PLANTILLA/template.yaml"
 [[ -f "$TPL" ]] || { echo "no existe $TPL" >&2; exit 1; }
 
+PREVIOS=""
 if aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" >/dev/null 2>&1; then
   TIPO=UPDATE
+  # Solo los parámetros que el stack ya tiene admiten UsePreviousValue; uno nuevo toma su Default.
+  PREVIOS=" $(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+    --query 'Stacks[0].Parameters[].ParameterKey' --output text | tr '\t' ' ') "
 else
   TIPO=CREATE
 fi
@@ -37,7 +41,7 @@ for k in $DECLARADOS; do
   if [[ $dado == 1 ]]; then
     # Comas dentro de un valor (listas) van escapadas para la CLI.
     ARGS+=("ParameterKey=$k,ParameterValue=${v//,/\\,}")
-  elif [[ $TIPO == UPDATE ]]; then
+  elif [[ $TIPO == UPDATE && "$PREVIOS" == *" $k "* ]]; then
     ARGS+=("ParameterKey=$k,UsePreviousValue=true")
   fi
 done
