@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Formulario de contacto → correo por Resend. Una Lambda chica con Function URL que se sirve
+  Formulario de contacto → correo por SES. Una Lambda chica con Function URL que se sirve
   como `/api/contacto` (o la ruta que use el sitio) detrás de la CloudFront de estatico/template.yaml.
 
 # Seguridad:
@@ -10,20 +10,20 @@ Description: >
 # - Rate limit por IP real (`cloudfront-viewer-address`) en memoria del contenedor, igual que en
 #   Vercel; la concurrencia reservada (2) pone un techo duro de envíos por segundo.
 # - Todo campo del formulario se escapa antes de ir al HTML del correo.
-# - La clave de Resend vive en SSM (SecureString), no en el template ni en el repo.
+# - Envía por SES con el rol de la Lambda: no hay clave que guardar ni rotar.
 
 Parameters:
   Proyecto:
     Type: String
-  ResendParametro:
+  IdentidadSes:
     Type: String
-    Description: Nombre del parámetro SecureString de SSM con la clave de Resend (ej. /lanelectric/resend-api-key).
-  Destino:
-    Type: String
-    Description: Correo que recibe los mensajes.
+    Description: Dominio verificado en SES (us-east-1) desde el que se envía (ej. lanelectric.cl o afachile.cl).
   Remitente:
     Type: String
-    Description: 'From del correo; el dominio tiene que estar verificado en Resend (ej. "Web <web@lanelectric.cl>").'
+    Description: 'From del correo, de ese dominio (ej. "Lan Electric Web <web@lanelectric.cl>").'
+  Destino:
+    Type: String
+    Description: Correo(s) que reciben los mensajes, separados por coma.
   Asunto:
     Type: String
     Default: Nuevo mensaje desde la web
@@ -52,19 +52,14 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: resend
+        # Solo puede enviar desde su identidad: un bug no manda correo "como" otro proyecto.
+        - PolicyName: ses
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: ssm:GetParameter
-                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ResendParametro}'
-              - Effect: Allow
-                Action: kms:Decrypt
-                Resource: '*'
-                Condition:
-                  StringEquals:
-                    kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
+                Action: ses:SendEmail
+                Resource: !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${IdentidadSes}'
 
   Logs:
     Type: AWS::Logs::LogGroup
@@ -79,7 +74,7 @@ Resources:
     DependsOn: Logs
     Properties:
       FunctionName: !Ref AWS::StackName
-      Description: Formulario de contacto → Resend.
+      Description: Formulario de contacto → SES.
       Runtime: nodejs22.x
       Architectures: [arm64]
       Handler: index.handler
@@ -91,7 +86,6 @@ Resources:
         - { Key: proyecto, Value: !Ref Proyecto }
       Environment:
         Variables:
-          RESEND_PARAM: !Ref ResendParametro
           DESTINO: !Ref Destino
           REMITENTE: !Ref Remitente
           ASUNTO: !Ref Asunto
@@ -99,9 +93,9 @@ Resources:
           API_SECRETO: !Ref ApiSecreto
       Code:
         ZipFile: |
-          const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
+          const { SESv2Client, SendEmailCommand } = require('@aws-sdk/client-sesv2');
+          const ses = new SESv2Client({});
           const E = process.env;
-          let clave;
           const vistos = new Map();
           const json = (s, b) => ({ statusCode: s, headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) });
           const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -133,17 +127,16 @@ Resources:
             const filas = Object.entries(d).filter(([k, v]) => k !== '_honeypot' && v !== '' && v != null)
               .map(([k, v]) => `<tr><td style="padding:8px;font-weight:bold">${esc(k)}</td><td style="padding:8px">${esc(v)}</td></tr>`).join('');
             try {
-              if (!clave) clave = (await new SSMClient({}).send(new GetParameterCommand({ Name: E.RESEND_PARAM, WithDecryption: true }))).Parameter.Value;
-              const r = await fetch('https://api.resend.com/emails', {
-                method: 'POST',
-                headers: { authorization: `Bearer ${clave}`, 'content-type': 'application/json' },
-                body: JSON.stringify({
-                  from: E.REMITENTE, to: E.DESTINO.split(','), reply_to: email || undefined,
-                  subject: `${E.ASUNTO}${d.name ? ' - ' + String(d.name).slice(0, 80) : ''}`.replace(/[\r\n]/g, ' '),
-                  html: `<h2>${esc(E.ASUNTO)}</h2><table style="border-collapse:collapse;width:100%">${filas}</table>`,
-                }),
-              });
-              if (!r.ok) { console.error('resend', r.status, await r.text()); return json(502, { error: 'No se pudo enviar.' }); }
+              const asunto = `${E.ASUNTO}${d.name ? ' - ' + String(d.name).slice(0, 80) : ''}`.replace(/[\r\n]/g, ' ');
+              await ses.send(new SendEmailCommand({
+                FromEmailAddress: E.REMITENTE,
+                Destination: { ToAddresses: E.DESTINO.split(',').map((x) => x.trim()) },
+                ReplyToAddresses: email ? [email] : undefined,
+                Content: { Simple: {
+                  Subject: { Data: asunto, Charset: 'UTF-8' },
+                  Body: { Html: { Data: `<h2>${esc(E.ASUNTO)}</h2><table style="border-collapse:collapse;width:100%">${filas}</table>`, Charset: 'UTF-8' } },
+                } },
+              }));
               return json(200, { success: true });
             } catch (e) { console.error(e); return json(500, { error: 'Error interno del servidor.' }); }
           };

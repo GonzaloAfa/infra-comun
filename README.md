@@ -9,7 +9,7 @@ Este repo tiene las plantillas y los workflows que comparten los proyectos de la
 | HTML estático (landing, portafolio, sitio de cliente) | S3 + CloudFront, con `estatico/` |
 | Frontend con SSR o ISR | Vercel, sin crons ni funciones largas |
 | API, webhook, cron, lote o IA | Lambda. Cada repo usa la herramienta que ya tiene (SAM o Serverless). |
-| Formulario de contacto de un sitio estático | Lambda, con `contacto/`, servida en `/api/*` del mismo dominio |
+| Formulario de contacto de un sitio estático | Lambda + SES, con `contacto/`, servida en `/api/*` del mismo dominio |
 | Crons | EventBridge Scheduler → Lambda. Nunca un cron de Vercel. |
 | DNS | Vercel DNS. Si hay certificados de ACM, agregar CAA de Amazon. |
 
@@ -33,12 +33,11 @@ Además:
 
 ## Formulario de contacto
 
-1. **Guardar la clave de Resend en SSM:**
-   ```
-   aws ssm put-parameter --type SecureString --name /<proyecto>/resend-api-key --value …
-   ```
+Se envía por **SES (us-east-1)**, que está en producción en la cuenta. No hace falta una clave: la Lambda envía con su rol, y solo puede hacerlo desde su propia identidad.
+
+1. **Verificar el dominio en SES:** `aws sesv2 create-email-identity --email-identity <dominio>` y luego crear los 3 CNAME de DKIM en Vercel DNS. Otra opción es usar un dominio que ya esté verificado, como `afachile.cl`.
 2. **Aplicar el stack de contacto:**
    ```
-   scripts/aplicar.sh contacto <proyecto>-contacto <proyecto> ResendParametro=/<proyecto>/resend-api-key Destino=… Remitente=… ApiSecreto=<32+ caracteres>
+   scripts/aplicar.sh contacto <proyecto>-contacto <proyecto> IdentidadSes=<dominio> Remitente="Web <web@dominio>" Destino=… ApiSecreto=<32+ caracteres>
    ```
-3. **Conectarlo al sitio.** Pasa su output `ApiHost` como `ApiOrigen` al stack estático, junto con el mismo `ApiSecreto`. El sitio llama `fetch('/api/…')`, en el mismo dominio y sin CORS.
+3. **Conectarlo al sitio.** El output `ApiHost` va como `ApiOrigen` del stack estático, junto con el mismo `ApiSecreto`. El sitio llama `fetch('/api/…')`, en el mismo dominio y sin CORS.
