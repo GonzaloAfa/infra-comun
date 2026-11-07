@@ -1,6 +1,6 @@
 # infra-comun
 
-Este repo tiene las plantillas y los workflows que comparten los proyectos de la cuenta AWS 287698983131 y del equipo `afachile` de Vercel.
+Este repo tiene las plantillas y los workflows que comparten los proyectos en AWS y Vercel.
 
 ## La regla: dónde vive cada cosa
 
