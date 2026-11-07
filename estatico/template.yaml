@@ -129,11 +129,14 @@ Resources:
           function handler(event) {
             var r = event.request;
             var host = r.headers.host ? r.headers.host.value : '';
-            if (CANONICO && host !== CANONICO && host.indexOf('.cloudfront.net') === -1) {
-              return { statusCode: 308, statusDescription: 'Permanent Redirect',
-                headers: { location: { value: 'https://' + CANONICO + r.uri + qs(r.querystring) } } };
-            }
             var ultimo = r.uri.split('/').pop();
+            var sinBarra = r.uri.charAt(r.uri.length - 1) !== '/' && ultimo.indexOf('.') === -1;
+            if (CANONICO && host !== CANONICO && host.indexOf('.cloudfront.net') === -1) {
+              // Un solo salto: con BarraFinal, `www/x` va directo a `canónico/x/`.
+              var destino = r.uri + (BARRA && sinBarra ? '/' : '');
+              return { statusCode: 308, statusDescription: 'Permanent Redirect',
+                headers: { location: { value: 'https://' + CANONICO + destino + qs(r.querystring) } } };
+            }
             if (r.uri.charAt(r.uri.length - 1) === '/') r.uri += 'index.html';
             else if (ultimo.indexOf('.') === -1 && r.uri.indexOf('/api/') !== 0) {
               if (BARRA) return { statusCode: 308, statusDescription: 'Permanent Redirect',
