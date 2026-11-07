@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Sitio estático en S3 + CloudFront, con su rol de despliegue para GitHub Actions (OIDC).
+  Uno por sitio. Aplicar con scripts/aplicar.sh (dry-run por defecto).
+
+# Qué resuelve: un sitio de HTML ya construido (Astro, Next export, HTML a mano) servido desde
+# un bucket privado detrás de CloudFront, sin cómputo por visita. Opcionalmente, `/api/*` va a
+# una Lambda (p. ej. contacto/template.yaml) por el MISMO dominio: el formulario no necesita CORS.
+
+Parameters:
+  Proyecto:
+    Type: String
+    Description: Valor de la etiqueta de costos `proyecto` (ej. lanelectric).
+  Repo:
+    Type: String
+    Description: Repo de GitHub que despliega, `dueño/nombre` (ej. GonzaloAfa/lanelectric_cl).
+  Rama:
+    Type: String
+    Default: main
+  DominioCanonico:
+    Type: String
+    Default: ''
+    Description: >
+      Dominio principal (ej. lanelectric.cl). Los demás Dominios responden 308 hacia él.
+      Vacío = solo *.cloudfront.net (fase de prueba).
+  DominiosExtra:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Otros dominios del certificado que redirigen al canónico (ej. www.lanelectric.cl).
+  CertificadoArn:
+    Type: String
+    Default: ''
+    Description: Certificado de ACM en us-east-1 que cubre DominioCanonico y DominiosExtra.
+  ApiOrigen:
+    Type: String
+    Default: ''
+    Description: >
+      Host de la Function URL que atiende `/api/*` (sin https:// ni barra; output ApiHost de
+      contacto/template.yaml). Vacío = sin API.
+  ApiSecreto:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Header `x-origen` que CloudFront manda a la API (el mismo ApiSecreto del stack de contacto).
+
+Conditions:
+  ConDominio: !Not [!Equals [!Ref DominioCanonico, '']]
+  ConExtras: !Not [!Equals [!Join ['', !Ref DominiosExtra], '']]
+  ConApi: !Not [!Equals [!Ref ApiOrigen, '']]
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+
+  Oac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}'
+        Description: CloudFront lee el sitio desde el bucket privado.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Encabezados:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${AWS::StackName}'
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 63072000
+            IncludeSubdomains: false
+            Preload: false
+            Override: true
+          ContentTypeOptions: { Override: true }
+          FrameOptions: { FrameOption: DENY, Override: true }
+          ReferrerPolicy: { ReferrerPolicy: strict-origin-when-cross-origin, Override: true }
+
+  # En el borde, antes de la caché:
+  # - cualquier host que no sea el canónico → 308 al canónico (www → apex);
+  # - `/ruta/` y `/ruta` → `/ruta/index.html` (formato de carpetas de Astro y de `next export`).
+  # El canónico va en el código (las CloudFront Functions no leen variables): se arma con !Sub.
+  Enrutador:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-enrutador'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Host canónico e index.html de carpetas.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub
+        - |
+          var CANONICO = '${Canonico}';
+          function qs(q) {
+            var p = [];
+            for (var k in q) {
+              var v = q[k];
+              if (v.multiValue) { for (var i = 0; i < v.multiValue.length; i++) p.push(k + '=' + v.multiValue[i].value); }
+              else p.push(v.value === '' ? k : k + '=' + v.value);
+            }
+            return p.length ? '?' + p.join('&') : '';
+          }
+          function handler(event) {
+            var r = event.request;
+            var host = r.headers.host ? r.headers.host.value : '';
+            if (CANONICO && host !== CANONICO && host.indexOf('.cloudfront.net') === -1) {
+              return { statusCode: 308, statusDescription: 'Permanent Redirect',
+                headers: { location: { value: 'https://' + CANONICO + r.uri + qs(r.querystring) } } };
+            }
+            if (r.uri.charAt(r.uri.length - 1) === '/') r.uri += 'index.html';
+            else if (r.uri.split('/').pop().indexOf('.') === -1) r.uri += '/index.html';
+            return r;
+          }
+        - Canonico: !Ref DominioCanonico
+
+  Distribucion:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${Proyecto} — sitio estático'
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Aliases: !If
+          - ConDominio
+          - !If
+            - ConExtras
+            - !Split [',', !Join [',', [!Ref DominioCanonico, !Join [',', !Ref DominiosExtra]]]]
+            - [!Ref DominioCanonico]
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - ConDominio
+          - AcmCertificateArn: !Ref CertificadoArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: Sitio
+            DomainName: !GetAtt Bucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt Oac.Id
+            S3OriginConfig: { OriginAccessIdentity: '' }
+          - !If
+            - ConApi
+            - Id: Api
+              DomainName: !Ref ApiOrigen
+              OriginCustomHeaders:
+                - { HeaderName: x-origen, HeaderValue: !Ref ApiSecreto }
+              CustomOriginConfig:
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols: [TLSv1.2]
+            - !Ref AWS::NoValue
+        # `/api/*` sin caché. CachingDisabled + AllViewerExceptHostHeader (managed): la Function
+        # URL necesita su propio Host, y recibe `cloudfront-viewer-address` para el rate limit.
+        CacheBehaviors: !If
+          - ConApi
+          - - PathPattern: /api/*
+              TargetOriginId: Api
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - !Ref AWS::NoValue
+        DefaultCacheBehavior:
+          TargetOriginId: Sitio
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # CachingOptimized (managed): sin query string ni cookies en la llave.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId: !Ref Encabezados
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt Enrutador.FunctionMetadata.FunctionARN
+        # Sin s3:ListBucket, lo que no existe responde 403: se sirve /404.html si el sitio lo trae.
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 404, ResponsePagePath: /404.html, ErrorCachingMinTTL: 60 }
+          - { ErrorCode: 404, ResponseCode: 404, ResponsePagePath: /404.html, ErrorCachingMinTTL: 60 }
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFrontLee
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${Bucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribucion}'
+
+  # GitHub Actions (solo la rama indicada del repo) sube el sitio e invalida. Nada más.
+  RolDeploy:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub 'Deploy de ${Repo} (${Rama}) al sitio estático ${AWS::StackName}.'
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${Repo}:ref:refs/heads/${Rama}'
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject, s3:GetObject]
+                Resource: !Sub '${Bucket.Arn}/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+              # El workflow lee bucket y distribución de los outputs del stack.
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Ref AWS::StackId
+              - Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribucion}'
+
+Outputs:
+  SitioUrl:
+    Value: !Sub 'https://${Distribucion.DomainName}'
+  CloudFrontHost:
+    Description: Destino del ALIAS/CNAME en el DNS.
+    Value: !GetAtt Distribucion.DomainName
+  DistribucionId:
+    Value: !Ref Distribucion
+  Bucket:
+    Value: !Ref Bucket
+  RolDeployArn:
+    Description: Va como variable AWS_DEPLOY_ROLE_ARN del repo.
+    Value: !GetAtt RolDeploy.Arn

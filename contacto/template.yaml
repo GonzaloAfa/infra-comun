@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Formulario de contacto → correo por Resend. Una Lambda chica con Function URL que se sirve
+  como `/api/contacto` (o la ruta que use el sitio) detrás de la CloudFront de estatico/template.yaml.
+
+# Seguridad:
+# - Solo acepta pedidos que traen el header `x-origen` con el secreto que CloudFront agrega
+#   (ApiSecreto, el mismo valor en los dos stacks). Llamar la Function URL directo da 403, así
+#   que nadie se salta el rate limit falsificando `cloudfront-viewer-address`.
+# - Rate limit por IP real (`cloudfront-viewer-address`) en memoria del contenedor, igual que en
+#   Vercel; la concurrencia reservada (2) pone un techo duro de envíos por segundo.
+# - Todo campo del formulario se escapa antes de ir al HTML del correo.
+# - La clave de Resend vive en SSM (SecureString), no en el template ni en el repo.
+
+Parameters:
+  Proyecto:
+    Type: String
+  ResendParametro:
+    Type: String
+    Description: Nombre del parámetro SecureString de SSM con la clave de Resend (ej. /lanelectric/resend-api-key).
+  Destino:
+    Type: String
+    Description: Correo que recibe los mensajes.
+  Remitente:
+    Type: String
+    Description: 'From del correo; el dominio tiene que estar verificado en Resend (ej. "Web <web@lanelectric.cl>").'
+  Asunto:
+    Type: String
+    Default: Nuevo mensaje desde la web
+  CamposRequeridos:
+    Type: String
+    Default: name,email,message
+    Description: Campos obligatorios, separados por coma.
+  ApiSecreto:
+    Type: String
+    NoEcho: true
+    MinLength: 24
+    Description: El mismo valor que ApiSecreto del stack estático.
+
+Resources:
+  Rol:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: resend
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ResendParametro}'
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
+
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}'
+      RetentionInDays: 14
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+
+  Funcion:
+    Type: AWS::Lambda::Function
+    DependsOn: Logs
+    Properties:
+      FunctionName: !Ref AWS::StackName
+      Description: Formulario de contacto → Resend.
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt Rol.Arn
+      MemorySize: 256
+      Timeout: 10
+      ReservedConcurrentExecutions: 2
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+      Environment:
+        Variables:
+          RESEND_PARAM: !Ref ResendParametro
+          DESTINO: !Ref Destino
+          REMITENTE: !Ref Remitente
+          ASUNTO: !Ref Asunto
+          REQUERIDOS: !Ref CamposRequeridos
+          API_SECRETO: !Ref ApiSecreto
+      Code:
+        ZipFile: |
+          const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
+          const E = process.env;
+          let clave;
+          const vistos = new Map();
+          const json = (s, b) => ({ statusCode: s, headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) });
+          const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+          function limitado(ip) {
+            const ahora = Date.now();
+            const t = (vistos.get(ip) || []).filter((x) => ahora - x < 60000);
+            if (t.length >= 3) return true;
+            t.push(ahora); vistos.set(ip, t);
+            if (vistos.size > 5000) vistos.clear();
+            return false;
+          }
+          exports.handler = async (ev) => {
+            const h = ev.headers || {};
+            if (!E.API_SECRETO || h['x-origen'] !== E.API_SECRETO) return json(403, { error: 'Prohibido.' });
+            if (ev.requestContext?.http?.method !== 'POST') return json(405, { error: 'Método no permitido.' });
+            const ip = (h['cloudfront-viewer-address'] || '').replace(/:\d+$/, '') || 'sin-ip';
+            if (limitado(ip)) return json(429, { error: 'Demasiadas solicitudes. Intenta en 1 minuto.' });
+            let d;
+            try {
+              const raw = ev.isBase64Encoded ? Buffer.from(ev.body || '', 'base64').toString() : ev.body || '';
+              if (raw.length > 20000) return json(413, { error: 'Mensaje demasiado largo.' });
+              d = JSON.parse(raw);
+            } catch { return json(400, { error: 'JSON inválido.' }); }
+            if (!d || typeof d !== 'object') return json(400, { error: 'JSON inválido.' });
+            if (d._honeypot) return json(200, { success: true });
+            for (const c of E.REQUERIDOS.split(',')) if (!String(d[c.trim()] ?? '').trim()) return json(400, { error: 'Campos requeridos faltantes.' });
+            const email = String(d.email || '');
+            if (email && !/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(email)) return json(400, { error: 'Correo inválido.' });
+            const filas = Object.entries(d).filter(([k, v]) => k !== '_honeypot' && v !== '' && v != null)
+              .map(([k, v]) => `<tr><td style="padding:8px;font-weight:bold">${esc(k)}</td><td style="padding:8px">${esc(v)}</td></tr>`).join('');
+            try {
+              if (!clave) clave = (await new SSMClient({}).send(new GetParameterCommand({ Name: E.RESEND_PARAM, WithDecryption: true }))).Parameter.Value;
+              const r = await fetch('https://api.resend.com/emails', {
+                method: 'POST',
+                headers: { authorization: `Bearer ${clave}`, 'content-type': 'application/json' },
+                body: JSON.stringify({
+                  from: E.REMITENTE, to: E.DESTINO.split(','), reply_to: email || undefined,
+                  subject: `${E.ASUNTO}${d.name ? ' - ' + String(d.name).slice(0, 80) : ''}`.replace(/[\r\n]/g, ' '),
+                  html: `<h2>${esc(E.ASUNTO)}</h2><table style="border-collapse:collapse;width:100%">${filas}</table>`,
+                }),
+              });
+              if (!r.ok) { console.error('resend', r.status, await r.text()); return json(502, { error: 'No se pudo enviar.' }); }
+              return json(200, { success: true });
+            } catch (e) { console.error(e); return json(500, { error: 'Error interno del servidor.' }); }
+          };
+
+  Url:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref Funcion
+      AuthType: NONE
+
+  PermisoUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Funcion
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  # Desde oct-2025 una Function URL pública exige también lambda:InvokeFunction (sin él, 403).
+  PermisoInvocar:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Funcion
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  ApiHost:
+    Description: Va como ApiOrigen del stack estático.
+    Value: !Select [2, !Split ['/', !GetAtt Url.FunctionUrl]]

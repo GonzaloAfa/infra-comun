@@ -1,0 +1,89 @@
+# Reusable workflow: construye un sitio estático y lo sube a su bucket + invalida CloudFront.
+#
+# Uso desde otro repo (.github/workflows/deploy.yml):
+#
+#   on:
+#     push:
+#       branches: [main]
+#       paths: ['src/**', 'public/**', 'package.json', 'pnpm-lock.yaml', 'astro.config.*']
+#     workflow_dispatch:
+#   permissions: { id-token: write, contents: read }
+#   jobs:
+#     deploy:
+#       uses: GonzaloAfa/infra-comun/.github/workflows/deploy-estatico.yml@main
+#       with:
+#         stack: lanelectric-sitio
+#
+# El rol, el bucket y la distribución salen de los outputs del stack: el repo no guarda ARNs.
+# Solo hace falta la variable de repo AWS_DEPLOY_ROLE_ARN (output RolDeployArn).
+name: deploy-estatico
+
+on:
+  workflow_call:
+    inputs:
+      stack:
+        description: Nombre del stack de estatico/template.yaml.
+        required: true
+        type: string
+      build:
+        description: Comando de build.
+        default: pnpm build
+        type: string
+      dist:
+        description: Carpeta que se sube.
+        default: dist
+        type: string
+      node:
+        default: '22'
+        type: string
+      region:
+        default: us-east-1
+        type: string
+
+concurrency:
+  group: deploy-estatico-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build
+        env:
+          BUILD: ${{ inputs.build }}
+        run: $BUILD
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+      - name: Subir e invalidar
+        env:
+          STACK: ${{ inputs.stack }}
+          DIST: ${{ inputs.dist }}
+          REGION: ${{ inputs.region }}
+        run: |
+          set -euo pipefail
+          out() { aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          BUCKET=$(out Bucket); DIST_ID=$(out DistribucionId)
+          # Solo lo que lleva hash en el nombre (_astro/, _next/static/) se cachea un año en el
+          # navegador. El resto: el navegador revalida y CloudFront guarda hasta la invalidación.
+          aws s3 sync "$DIST" "s3://$BUCKET" --delete --exclude '*' \
+            --include '_astro/*' --include '_next/static/*' \
+            --cache-control 'public, max-age=31536000, immutable'
+          aws s3 sync "$DIST" "s3://$BUCKET" --delete \
+            --exclude '_astro/*' --exclude '_next/static/*' \
+            --cache-control 'public, max-age=0, s-maxage=31536000, must-revalidate'
+          aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths '/*' \
+            --query 'Invalidation.Id' --output text
