@@ -1,0 +1,245 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Rearmado de un sitio estático en CodeBuild: build del repo, subida a su bucket e
+  invalidación de CloudFront. Para sitios cuyo HTML depende de datos que cambian (un
+  catálogo, un blog) y que antes refrescaba un ISR. Va junto a un stack de estatico/.
+
+# Disparadores:
+# - Deploy de código: el workflow del repo sube el fuente (`git archive`) a FuenteBucket y
+#   llama StartBuild. El build corre acá, no en Actions: el job de Actions dura segundos.
+# - Diario: EventBridge Scheduler (Horario, en UTC).
+# - Bajo demanda: quien tenga permiso de StartBuild sobre el proyecto (p. ej. el backend
+#   cuando se publica algo en el admin). Concurrencia 1: si ya hay uno corriendo, el
+#   pedido falla y basta con el que está en curso.
+
+Parameters:
+  Proyecto:
+    Type: String
+  Repo:
+    Type: String
+    Description: '`dueño/nombre` del repo (para el rol de OIDC que sube el fuente).'
+  Rama:
+    Type: String
+    Default: main
+  SitioBucket:
+    Type: String
+    Description: Output Bucket del stack estático.
+  SitioDistribucionId:
+    Type: String
+    Description: Output DistribucionId del stack estático.
+  ComandoBuild:
+    Type: String
+    Default: npm ci && npm run build
+  Dist:
+    Type: String
+    Default: out
+  VariablesBuild:
+    Type: String
+    Default: ''
+    Description: 'Variables públicas del build, `K=V` separadas por `;` (ej. NEXT_PUBLIC_API_URL=https://…).'
+  Horario:
+    Type: String
+    Default: cron(0 9 * * ? *)
+    Description: Expresión de EventBridge Scheduler para el rearmado diario (UTC). 'none' = sin horario.
+
+Conditions:
+  ConHorario: !Not [!Equals [!Ref Horario, 'none']]
+
+Resources:
+  FuenteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: versiones-viejas
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 7
+      VersioningConfiguration: { Status: Enabled }
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${AWS::StackName}'
+      RetentionInDays: 14
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+
+  RolBuild:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: rearmado
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${Logs.Arn}:*'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub '${FuenteBucket.Arn}/*'
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject, s3:GetObject]
+                Resource: !Sub 'arn:aws:s3:::${SitioBucket}/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub 'arn:aws:s3:::${SitioBucket}'
+              - Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${SitioDistribucionId}'
+
+  Build:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref AWS::StackName
+      Description: !Sub 'Rearmado del sitio estático de ${Proyecto}.'
+      ServiceRole: !GetAtt RolBuild.Arn
+      ConcurrentBuildLimit: 1
+      TimeoutInMinutes: 30
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+      Artifacts: { Type: NO_ARTIFACTS }
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref Logs }
+      Source:
+        Type: S3
+        Location: !Sub '${FuenteBucket}/fuente.zip'
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 22
+            build:
+              commands:
+                - |
+                  set -e
+                  # VARIABLES_BUILD="K=V;K=V" → export
+                  IFS=';' read -ra PARES <<< "${VARIABLES_BUILD}"
+                  for par in "${PARES[@]}"; do [ -n "$par" ] && export "$par"; done
+                  bash -c "$COMANDO_BUILD"
+                - |
+                  set -e
+                  # Solo lo que lleva hash (_next/static, _astro) se cachea un año en el navegador.
+                  # Sin --delete: quien tenga abierta una versión anterior sigue pidiendo sus
+                  # chunks con hash durante el rearmado. Son pocos KB por build.
+                  aws s3 sync "$DIST" "s3://$SITIO_BUCKET" --exclude '*' \
+                    --include '_next/static/*' --include '_astro/*' \
+                    --cache-control 'public, max-age=31536000, immutable'
+                  aws s3 sync "$DIST" "s3://$SITIO_BUCKET" --delete \
+                    --exclude '_next/static/*' --exclude '_astro/*' \
+                    --cache-control 'public, max-age=0, s-maxage=31536000, must-revalidate'
+                  aws cloudfront create-invalidation --distribution-id "$SITIO_DISTRIBUCION" --paths '/*'
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        EnvironmentVariables:
+          - { Name: COMANDO_BUILD, Value: !Ref ComandoBuild }
+          - { Name: DIST, Value: !Ref Dist }
+          - { Name: VARIABLES_BUILD, Value: !Ref VariablesBuild }
+          - { Name: SITIO_BUCKET, Value: !Ref SitioBucket }
+          - { Name: SITIO_DISTRIBUCION, Value: !Ref SitioDistribucionId }
+
+  # Rearmado diario.
+  RolHorario:
+    Type: AWS::IAM::Role
+    Condition: ConHorario
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-build
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt Build.Arn
+
+  RearmadoDiario:
+    Type: AWS::Scheduler::Schedule
+    Condition: ConHorario
+    Properties:
+      Name: !Sub '${AWS::StackName}-diario'
+      Description: !Sub 'Rearmado diario del sitio de ${Proyecto}.'
+      ScheduleExpression: !Ref Horario
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:codebuild:startBuild
+        RoleArn: !GetAtt RolHorario.Arn
+        Input: !Sub '{"ProjectName": "${Build}"}'
+        RetryPolicy: { MaximumRetryAttempts: 2 }
+
+  # GitHub Actions (rama indicada) sube el fuente y dispara el build.
+  RolDeploy:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub 'Sube el fuente de ${Repo} y dispara el rearmado.'
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${Repo}:ref:refs/heads/${Rama}'
+      Policies:
+        - PolicyName: fuente
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${FuenteBucket.Arn}/fuente.zip'
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: !GetAtt Build.Arn
+
+  # Política para adjuntar a quien dispare el rearmado bajo demanda (p. ej. el rol del backend).
+  PoliticaDisparar:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: !Sub 'Permite disparar el rearmado del sitio de ${Proyecto}.'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [codebuild:StartBuild, codebuild:ListBuildsForProject, codebuild:BatchGetBuilds]
+            Resource: !GetAtt Build.Arn
+
+Outputs:
+  ProyectoBuild:
+    Value: !Ref Build
+  FuenteBucket:
+    Value: !Ref FuenteBucket
+  RolDeployArn:
+    Description: Variable AWS_REARMADO_ROLE_ARN del repo.
+    Value: !GetAtt RolDeploy.Arn
+  PoliticaDispararArn:
+    Description: Adjuntar al rol que dispare rearmados bajo demanda.
+    Value: !Ref PoliticaDisparar

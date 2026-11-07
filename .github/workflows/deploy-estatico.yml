@@ -83,7 +83,9 @@ jobs:
           BUCKET=$(out Bucket); DIST_ID=$(out DistribucionId)
           # Solo lo que lleva hash en el nombre (_astro/, _next/static/) se cachea un año en el
           # navegador. El resto: el navegador revalida y CloudFront guarda hasta la invalidación.
-          aws s3 sync "$DIST" "s3://$BUCKET" --delete --exclude '*' \
+          # Sin --delete en los assets con hash: quien tenga abierta la versión anterior
+          # sigue pidiendo sus chunks durante el deploy.
+          aws s3 sync "$DIST" "s3://$BUCKET" --exclude '*' \
             --include '_astro/*' --include '_next/static/*' \
             --cache-control 'public, max-age=31536000, immutable'
           aws s3 sync "$DIST" "s3://$BUCKET" --delete \

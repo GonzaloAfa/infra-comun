@@ -8,7 +8,7 @@
 # Los parámetros que no se pasan conservan su valor anterior (UsePreviousValue) si el stack existe.
 set -euo pipefail
 
-PLANTILLA="${1:?plantilla (estatico|contacto|oidc-serverless)}"; STACK="${2:?stack}"; PROYECTO="${3:?proyecto}"; shift 3
+PLANTILLA="${1:?plantilla (estatico|contacto|oidc-serverless|rearmado)}"; STACK="${2:?stack}"; PROYECTO="${3:?proyecto}"; shift 3
 APLICAR=0; PARAMS=()
 for a in "$@"; do
   if [[ "$a" == "--apply" ]]; then APLICAR=1; else PARAMS+=("$a"); fi
