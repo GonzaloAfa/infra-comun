@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Rol de deploy por OIDC para un backend de Serverless Framework (o SAM) desplegado desde
+  GitHub Actions. Reemplaza las llaves fijas de un usuario IAM. Acotado al prefijo del
+  servicio: el stack, las funciones, los roles, los logs y el bucket de deploy se llaman
+  `<Servicio>-<stage>-…`.
+
+Parameters:
+  Proyecto:
+    Type: String
+  Repo:
+    Type: String
+    Description: '`dueño/nombre` del repo de GitHub.'
+  Rama:
+    Type: String
+    Default: main
+  Entorno:
+    Type: String
+    Default: ''
+    Description: >
+      Si el job usa `environment:`, GitHub firma el token con `environment:<nombre>` en vez de
+      la rama, y el rol tiene que confiar en eso (ej. production). Vacío = por rama.
+  Servicio:
+    Type: String
+    Description: '`service:` de serverless.yml (ej. trabajaenlatam-api). Prefijo de todo lo que crea.'
+  PoliticaExtraArn:
+    Type: String
+    Default: ''
+    Description: Política administrada adicional (opcional), para lo que el servicio necesite fuera del prefijo.
+
+Conditions:
+  ConExtra: !Not [!Equals [!Ref PoliticaExtraArn, '']]
+  ConEntorno: !Not [!Equals [!Ref Entorno, '']]
+
+Resources:
+  Rol:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub 'Deploy de ${Repo} (${Rama}) del servicio ${Servicio}, por OIDC.'
+      MaxSessionDuration: 3600
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+      ManagedPolicyArns: !If [ConExtra, [!Ref PoliticaExtraArn], !Ref AWS::NoValue]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !If
+                  - ConEntorno
+                  - !Sub 'repo:${Repo}:environment:${Entorno}'
+                  - !Sub 'repo:${Repo}:ref:refs/heads/${Rama}'
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Stack
+                Effect: Allow
+                Action: cloudformation:*
+                Resource: !Sub 'arn:aws:cloudformation:*:${AWS::AccountId}:stack/${Servicio}-*/*'
+              - Sid: CloudFormationGlobal
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStacks
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ListExports
+                  - cloudformation:GetTemplateSummary
+                Resource: '*'
+              - Sid: Funciones
+                Effect: Allow
+                Action: lambda:*
+                Resource:
+                  - !Sub 'arn:aws:lambda:*:${AWS::AccountId}:function:${Servicio}-*'
+                  - !Sub 'arn:aws:lambda:*:${AWS::AccountId}:layer:${Servicio}-*'
+              - Sid: LambdaGlobal
+                Effect: Allow
+                Action:
+                  - lambda:ListFunctions
+                  - lambda:GetAccountSettings
+                  - lambda:ListEventSourceMappings
+                  - lambda:CreateEventSourceMapping
+                  - lambda:GetEventSourceMapping
+                  - lambda:UpdateEventSourceMapping
+                  - lambda:DeleteEventSourceMapping
+                Resource: '*'
+              - Sid: BucketDeDeploy
+                Effect: Allow
+                Action: s3:*
+                Resource:
+                  - !Sub 'arn:aws:s3:::${Servicio}-*'
+                  - !Sub 'arn:aws:s3:::${Servicio}-*/*'
+              - Sid: Roles
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:UpdateRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PassRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${Servicio}-*'
+              - Sid: Logs
+                Effect: Allow
+                Action: logs:*
+                Resource: !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/${Servicio}-*'
+              - Sid: LogsGlobal
+                Effect: Allow
+                Action: [logs:DescribeLogGroups, logs:ListTagsForResource, logs:TagResource]
+                Resource: '*'
+              # Las ARN de API Gateway no llevan el nombre del servicio: no se pueden acotar por prefijo.
+              - Sid: ApiGateway
+                Effect: Allow
+                Action: apigateway:*
+                Resource: !Sub 'arn:aws:apigateway:*::*'
+              - Sid: Eventos
+                Effect: Allow
+                Action: events:*
+                Resource: !Sub 'arn:aws:events:*:${AWS::AccountId}:rule/${Servicio}-*'
+              - Sid: Lectura
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - acm:ListCertificates
+                  - acm:DescribeCertificate
+                  - events:DescribeRule
+                  - events:ListRules
+                  - sts:GetCallerIdentity
+                Resource: '*'
+
+Outputs:
+  RolArn:
+    Description: Va como variable AWS_DEPLOY_ROLE_ARN del repo.
+    Value: !GetAtt Rol.Arn
