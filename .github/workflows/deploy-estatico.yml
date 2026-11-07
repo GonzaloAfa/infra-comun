@@ -26,7 +26,7 @@ on:
         required: true
         type: string
       build:
-        description: Comando de build.
+        description: Comando de build. Vacío = el repo ya trae el HTML (sin install ni build).
         default: pnpm build
         type: string
       dist:
@@ -54,12 +54,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
+        if: inputs.build != ''
       - uses: actions/setup-node@v4
+        if: inputs.build != ''
         with:
           node-version: ${{ inputs.node }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+        if: inputs.build != ''
       - name: Build
+        if: inputs.build != ''
         env:
           BUILD: ${{ inputs.build }}
         run: $BUILD

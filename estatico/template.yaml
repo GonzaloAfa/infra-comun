@@ -31,6 +31,13 @@ Parameters:
     Type: String
     Default: ''
     Description: Certificado de ACM en us-east-1 que cubre DominioCanonico y DominiosExtra.
+  BarraFinal:
+    Type: String
+    Default: 'no'
+    AllowedValues: ['si', 'no']
+    Description: >
+      'si' = `/ruta` responde 308 a `/ruta/` (sitios cuyas URLs canónicas llevan barra final,
+      como `trailingSlash: true` de Vercel). 'no' = `/ruta` y `/ruta/` sirven lo mismo.
   ApiOrigen:
     Type: String
     Default: ''
@@ -95,7 +102,8 @@ Resources:
 
   # En el borde, antes de la caché:
   # - cualquier host que no sea el canónico → 308 al canónico (www → apex);
-  # - `/ruta/` y `/ruta` → `/ruta/index.html` (formato de carpetas de Astro y de `next export`).
+  # - `/ruta/` → `/ruta/index.html` (formato de carpetas de Astro y de `next export`); `/ruta` sirve
+  #   lo mismo, o con BarraFinal=si responde 308 a `/ruta/`.
   # El canónico va en el código (las CloudFront Functions no leen variables): se arma con !Sub.
   Enrutador:
     Type: AWS::CloudFront::Function
@@ -108,6 +116,7 @@ Resources:
       FunctionCode: !Sub
         - |
           var CANONICO = '${Canonico}';
+          var BARRA = '${Barra}' === 'si';
           function qs(q) {
             var p = [];
             for (var k in q) {
@@ -124,11 +133,17 @@ Resources:
               return { statusCode: 308, statusDescription: 'Permanent Redirect',
                 headers: { location: { value: 'https://' + CANONICO + r.uri + qs(r.querystring) } } };
             }
+            var ultimo = r.uri.split('/').pop();
             if (r.uri.charAt(r.uri.length - 1) === '/') r.uri += 'index.html';
-            else if (r.uri.split('/').pop().indexOf('.') === -1) r.uri += '/index.html';
+            else if (ultimo.indexOf('.') === -1 && r.uri.indexOf('/api/') !== 0) {
+              if (BARRA) return { statusCode: 308, statusDescription: 'Permanent Redirect',
+                headers: { location: { value: r.uri + '/' + qs(r.querystring) } } };
+              r.uri += '/index.html';
+            }
             return r;
           }
         - Canonico: !Ref DominioCanonico
+          Barra: !Ref BarraFinal
 
   Distribucion:
     Type: AWS::CloudFront::Distribution
