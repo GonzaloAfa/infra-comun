@@ -31,6 +31,16 @@ Además:
 4. **Volver a aplicar el stack** con `DominioCanonico=…`, `DominiosExtra=www.…` y `CertificadoArn=…`.
 5. **Hacer el corte.** En Vercel DNS, apunta el apex con un ALIAS y `www` con un CNAME al output `CloudFrontHost`. El proyecto de Vercel queda como rollback unas semanas y después se pausa.
 
+## Sitio estático que ya existía
+
+Para un sitio cuyo bucket y CloudFront se crearon antes de `estatico/` y solo hay que sacarle las llaves fijas:
+
+```
+scripts/aplicar.sh oidc-estatico <proyecto>-deploy <proyecto> Repo=GonzaloAfa/<repo> Bucket=<bucket> DistribucionId=<id> [Funcion=<lambda>] --apply
+```
+
+Crea solo el rol (subir al bucket, invalidar la distribución y, si se pasa `Funcion`, actualizar el código de esa Lambda). El output `RolDeployArn` va en la variable `AWS_DEPLOY_ROLE_ARN` del repo, y el workflow usa `role-to-assume` en vez de las llaves. Como expone `Bucket` y `DistribucionId`, también sirve con `deploy-estatico.yml`. En uso: `afachile-deploy` (afachile.cl) y `futbol-deploy` (futbol.afachile.cl).
+
 ## Formulario de contacto
 
 Se envía por **SES (us-east-1)**, que está en producción en la cuenta. No hace falta una clave: la Lambda envía con su rol, y solo puede hacerlo desde su propia identidad.

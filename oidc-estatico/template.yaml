@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Rol de deploy por OIDC para un sitio estático cuyo bucket y CloudFront ya existen (creados
+  antes de `estatico/`). Reemplaza las llaves fijas de un usuario IAM: solo puede subir al
+  bucket, invalidar su distribución y, opcionalmente, actualizar el código de una Lambda.
+  Expone Bucket y DistribucionId como outputs, igual que `estatico/`, así que también sirve
+  con el reusable `deploy-estatico.yml`.
+
+Parameters:
+  Proyecto:
+    Type: String
+  Repo:
+    Type: String
+    Description: '`dueño/nombre` del repo de GitHub.'
+  Rama:
+    Type: String
+    Default: main
+  Bucket:
+    Type: String
+    Description: Nombre del bucket existente del sitio.
+  DistribucionId:
+    Type: String
+    Description: ID de la distribución de CloudFront existente.
+  Funcion:
+    Type: String
+    Default: ''
+    Description: Nombre de una Lambda cuyo código despliega el repo (ej. formulario de contacto). Vacío = ninguna.
+
+Conditions:
+  ConFuncion: !Not [!Equals [!Ref Funcion, '']]
+
+Resources:
+  RolDeploy:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub 'Deploy de ${Repo} (${Rama}) a s3://${Bucket}, por OIDC.'
+      MaxSessionDuration: 3600
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${Repo}:ref:refs/heads/${Rama}'
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Listar
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub 'arn:aws:s3:::${Bucket}'
+              - Sid: Subir
+                Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject, s3:GetObject]
+                Resource: !Sub 'arn:aws:s3:::${Bucket}/*'
+              - Sid: Invalidar
+                Effect: Allow
+                Action: [cloudfront:CreateInvalidation, cloudfront:GetInvalidation]
+                Resource: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${DistribucionId}'
+              - Sid: Outputs
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Ref AWS::StackId
+        - !If
+          - ConFuncion
+          - PolicyName: funcion
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: [lambda:UpdateFunctionCode, lambda:GetFunction]
+                  Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${Funcion}'
+          - !Ref AWS::NoValue
+
+Outputs:
+  RolDeployArn:
+    Description: Va como variable AWS_DEPLOY_ROLE_ARN del repo.
+    Value: !GetAtt RolDeploy.Arn
+  Bucket:
+    Value: !Ref Bucket
+  DistribucionId:
+    Value: !Ref DistribucionId
