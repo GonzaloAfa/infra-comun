@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Crons de una app que vive en otro lado (ej. Vercel Hobby, que solo permite crons diarios).
+  EventBridge Scheduler invoca una Lambda mínima que hace GET a `BaseUrl + ruta` con
+  `Authorization: Bearer <CronSecret>` y falla si la respuesta no es 2xx (queda en los logs).
+  Hasta 6 tareas, cada una como `ruta|expresión`, ej. `/api/cron/expire-reservations|rate(10 minutes)`
+  o `/api/cron/tax-documents|cron(0 */6 * * ? *)`. Una tarea vacía no se crea.
+
+Parameters:
+  Proyecto:
+    Type: String
+  BaseUrl:
+    Type: String
+    Description: Origen de la app, sin barra final (ej. https://ticketera.resonarapp.cl).
+  CronSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: El mismo valor que CRON_SECRET en la app.
+  Zona:
+    Type: String
+    Default: America/Santiago
+  Activo:
+    Type: String
+    AllowedValues: [ENABLED, DISABLED]
+    Default: ENABLED
+  TimeoutSegundos:
+    Type: Number
+    Default: 60
+    MaxValue: 900
+    Description: Debe cubrir la ruta más lenta (ej. 310 si una ruta tiene maxDuration 300).
+  Tarea1: { Type: String, Default: '' }
+  Tarea2: { Type: String, Default: '' }
+  Tarea3: { Type: String, Default: '' }
+  Tarea4: { Type: String, Default: '' }
+  Tarea5: { Type: String, Default: '' }
+  Tarea6: { Type: String, Default: '' }
+
+Conditions:
+  Con1: !Not [!Equals [!Ref Tarea1, '']]
+  Con2: !Not [!Equals [!Ref Tarea2, '']]
+  Con3: !Not [!Equals [!Ref Tarea3, '']]
+  Con4: !Not [!Equals [!Ref Tarea4, '']]
+  Con5: !Not [!Equals [!Ref Tarea5, '']]
+  Con6: !Not [!Equals [!Ref Tarea6, '']]
+
+Resources:
+  RolFuncion:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags: [{ Key: proyecto, Value: !Ref Proyecto }]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt Logs.Arn
+
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Proyecto}-cron-http'
+      RetentionInDays: 14
+      Tags: [{ Key: proyecto, Value: !Ref Proyecto }]
+
+  Funcion:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Proyecto}-cron-http'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Architectures: [arm64]
+      MemorySize: 128
+      Timeout: !Ref TimeoutSegundos
+      Role: !GetAtt RolFuncion.Arn
+      LoggingConfig: { LogGroup: !Ref Logs }
+      Environment:
+        Variables:
+          BASE_URL: !Ref BaseUrl
+          CRON_SECRET: !Ref CronSecret
+      Tags: [{ Key: proyecto, Value: !Ref Proyecto }]
+      Code:
+        ZipFile: |
+          exports.handler = async (evento) => {
+            const url = process.env.BASE_URL + evento.ruta;
+            const t0 = Date.now();
+            const r = await fetch(url, {
+              headers: { Authorization: 'Bearer ' + process.env.CRON_SECRET, 'User-Agent': 'cron-http' },
+            });
+            const cuerpo = (await r.text()).slice(0, 1000);
+            console.log(JSON.stringify({ ruta: evento.ruta, status: r.status, ms: Date.now() - t0, cuerpo }));
+            if (!r.ok) throw new Error(`${evento.ruta} respondió ${r.status}`);
+          };
+
+  RolScheduler:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags: [{ Key: proyecto, Value: !Ref Proyecto }]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invocar
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt Funcion.Arn
+
+  Grupo:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub '${Proyecto}-cron'
+      Tags: [{ Key: proyecto, Value: !Ref Proyecto }]
+
+  Tarea1Schedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: Con1
+    Properties:
+      GroupName: !Ref Grupo
+      State: !Ref Activo
+      ScheduleExpression: !Select [1, !Split ['|', !Ref Tarea1]]
+      ScheduleExpressionTimezone: !Ref Zona
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      Target:
+        Arn: !GetAtt Funcion.Arn
+        RoleArn: !GetAtt RolScheduler.Arn
+        Input: !Sub ['{"ruta":"${R}"}', { R: !Select [0, !Split ['|', !Ref Tarea1]] }]
+        RetryPolicy: { MaximumRetryAttempts: 0 }
+  Tarea2Schedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: Con2
+    Properties:
+      GroupName: !Ref Grupo
+      State: !Ref Activo
+      ScheduleExpression: !Select [1, !Split ['|', !Ref Tarea2]]
+      ScheduleExpressionTimezone: !Ref Zona
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      Target:
+        Arn: !GetAtt Funcion.Arn
+        RoleArn: !GetAtt RolScheduler.Arn
+        Input: !Sub ['{"ruta":"${R}"}', { R: !Select [0, !Split ['|', !Ref Tarea2]] }]
+        RetryPolicy: { MaximumRetryAttempts: 0 }
+  Tarea3Schedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: Con3
+    Properties:
+      GroupName: !Ref Grupo
+      State: !Ref Activo
+      ScheduleExpression: !Select [1, !Split ['|', !Ref Tarea3]]
+      ScheduleExpressionTimezone: !Ref Zona
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      Target:
+        Arn: !GetAtt Funcion.Arn
+        RoleArn: !GetAtt RolScheduler.Arn
+        Input: !Sub ['{"ruta":"${R}"}', { R: !Select [0, !Split ['|', !Ref Tarea3]] }]
+        RetryPolicy: { MaximumRetryAttempts: 0 }
+  Tarea4Schedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: Con4
+    Properties:
+      GroupName: !Ref Grupo
+      State: !Ref Activo
+      ScheduleExpression: !Select [1, !Split ['|', !Ref Tarea4]]
+      ScheduleExpressionTimezone: !Ref Zona
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      Target:
+        Arn: !GetAtt Funcion.Arn
+        RoleArn: !GetAtt RolScheduler.Arn
+        Input: !Sub ['{"ruta":"${R}"}', { R: !Select [0, !Split ['|', !Ref Tarea4]] }]
+        RetryPolicy: { MaximumRetryAttempts: 0 }
+  Tarea5Schedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: Con5
+    Properties:
+      GroupName: !Ref Grupo
+      State: !Ref Activo
+      ScheduleExpression: !Select [1, !Split ['|', !Ref Tarea5]]
+      ScheduleExpressionTimezone: !Ref Zona
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      Target:
+        Arn: !GetAtt Funcion.Arn
+        RoleArn: !GetAtt RolScheduler.Arn
+        Input: !Sub ['{"ruta":"${R}"}', { R: !Select [0, !Split ['|', !Ref Tarea5]] }]
+        RetryPolicy: { MaximumRetryAttempts: 0 }
+  Tarea6Schedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: Con6
+    Properties:
+      GroupName: !Ref Grupo
+      State: !Ref Activo
+      ScheduleExpression: !Select [1, !Split ['|', !Ref Tarea6]]
+      ScheduleExpressionTimezone: !Ref Zona
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      Target:
+        Arn: !GetAtt Funcion.Arn
+        RoleArn: !GetAtt RolScheduler.Arn
+        Input: !Sub ['{"ruta":"${R}"}', { R: !Select [0, !Split ['|', !Ref Tarea6]] }]
+        RetryPolicy: { MaximumRetryAttempts: 0 }
+
+Outputs:
+  Funcion:
+    Description: Para probar a mano con `aws lambda invoke --payload '{"ruta":"/api/cron/…"}'`.
+    Value: !Ref Funcion
+  Grupo:
+    Value: !Ref Grupo

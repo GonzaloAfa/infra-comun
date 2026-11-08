@@ -51,3 +51,14 @@ Se envía por **SES (us-east-1)**, que está en producción en la cuenta. No hac
    scripts/aplicar.sh contacto <proyecto>-contacto <proyecto> IdentidadSes=<dominio> Remitente="Web <web@dominio>" Destino=… ApiSecreto=<32+ caracteres>
    ```
 3. **Conectarlo al sitio.** El output `ApiHost` va como `ApiOrigen` del stack estático, junto con el mismo `ApiSecreto`. El sitio llama `fetch('/api/…')`, en el mismo dominio y sin CORS.
+
+## Crons de una app que vive en Vercel
+
+Vercel Hobby solo permite crons diarios. `cron-http/` programa en EventBridge Scheduler una Lambda mínima que hace GET a cada ruta con `Authorization: Bearer <CronSecret>`:
+
+```
+scripts/aplicar.sh cron-http <proyecto>-cron <proyecto> BaseUrl=https://… CronSecret=<CRON_SECRET de la app> \
+  Tarea1='/api/cron/x|rate(10 minutes)' Tarea2='/api/cron/y|cron(0 */6 * * ? *)' [TimeoutSegundos=310] --apply
+```
+
+Hasta 6 tareas (`ruta|expresión`, hora de `America/Santiago`). `Activo=DISABLED` las pausa sin borrar nada. Cada corrida queda en `/aws/lambda/<proyecto>-cron-http` (14 días); una respuesta que no sea 2xx aparece como error de la Lambda.
